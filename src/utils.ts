@@ -1,14 +1,14 @@
-import * as qs from 'qs';
+import {RequestOptions} from './lib.js';
 import {
+  BaseAddress,
   RequestData,
   UrlInterpolator,
-  RequestArgs,
-  StripeResourceObject,
   RequestHeaders,
   MultipartRequestData,
   RequestAuthenticator,
   StripeRequest,
   ApiMode,
+  DEFAULT_BASE_ADDRESSES,
 } from './Types.js';
 
 const OPTIONS_KEYS = [
@@ -18,9 +18,10 @@ const OPTIONS_KEYS = [
   'apiVersion',
   'maxNetworkRetries',
   'timeout',
-  'host',
+  'apiBase',
   'authenticator',
   'stripeContext',
+  'headers',
   'additionalHeaders',
   'streaming',
 ];
@@ -32,7 +33,7 @@ type Settings = {
 
 type Options = {
   authenticator?: RequestAuthenticator | null;
-  host: string | null;
+  apiBase: BaseAddress | null;
   settings: Settings;
   streaming?: boolean;
   headers: RequestHeaders;
@@ -50,23 +51,87 @@ export function isOptionsHash(o: unknown): boolean | unknown {
  * Stringifies an Object, accommodating nested objects
  * (forming the conventional key 'parent[child]=value')
  */
-export function queryStringifyRequestData(
-  data: RequestData | string,
-  apiMode?: ApiMode
-): string {
+export function queryStringifyRequestData(data: RequestData | string): string {
+  return stringifyRequestData(data);
+}
+
+/**
+ * Encodes a value for use in a query string, keeping brackets unencoded
+ * for readability (the server accepts both encoded and unencoded brackets).
+ */
+function encodeQueryValue(value: string): string {
   return (
-    qs
-      .stringify(data, {
-        serializeDate: (d: Date) => Math.floor(d.getTime() / 1000).toString(),
-        // Always use indexed format for arrays
-        arrayFormat: 'indices',
-      })
-      // Don't use strict form encoding by changing the square bracket control
-      // characters back to their literals. This is fine by the server, and
-      // makes these parameter strings easier to read.
+    encodeURIComponent(value)
+      // Encode characters not encoded by encodeURIComponent but encoded by qs
+      .replace(/!/g, '%21')
+      .replace(/\*/g, '%2A')
+      .replace(/\(/g, '%28')
+      .replace(/\)/g, '%29')
+      .replace(/'/g, '%27')
+      // Decode brackets for readability (server accepts both)
       .replace(/%5B/g, '[')
       .replace(/%5D/g, ']')
   );
+}
+
+/**
+ * Converts a value to a string representation for query string encoding.
+ * Dates are converted to Unix timestamps.
+ */
+function valueToString(value: unknown): string {
+  if (value instanceof Date) {
+    return Math.floor(value.getTime() / 1000).toString();
+  }
+  if (value === null) {
+    return '';
+  }
+  return String(value);
+}
+
+/**
+ * Custom query string stringifier that handles nested objects and arrays.
+ * Produces output compatible with the qs library's indexed array format.
+ */
+function stringifyRequestData(data: RequestData | string): string {
+  const pairs: string[] = [];
+
+  function encode(key: string, value: unknown): void {
+    if (value === undefined) {
+      return;
+    }
+
+    if (value === null || typeof value !== 'object' || value instanceof Date) {
+      // Primitive value (including null and Date)
+      pairs.push(
+        encodeQueryValue(key) + '=' + encodeQueryValue(valueToString(value))
+      );
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      // Array: use indexed format arr[0], arr[1], etc.
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] !== undefined) {
+          encode(key + '[' + i + ']', value[i]);
+        }
+      }
+      return;
+    }
+
+    // Object: recurse with bracket notation
+    for (const k of Object.keys(value)) {
+      encode(key + '[' + k + ']', (value as Record<string, unknown>)[k]);
+    }
+  }
+
+  // Handle top-level object
+  if (typeof data === 'object' && data !== null) {
+    for (const key of Object.keys(data)) {
+      encode(key, (data as Record<string, unknown>)[key]);
+    }
+  }
+
+  return pairs.join('&');
 }
 
 /**
@@ -111,149 +176,82 @@ export function extractUrlParams(path: string): Array<string> {
 }
 
 /**
- * Return the data argument from a list of arguments
- *
- * @param {object[]} args
- * @returns {object}
+ * enforces that only supplied API bases are allowed.
  */
-export function getDataFromArgs(args: RequestArgs): RequestData {
-  if (!Array.isArray(args) || !args[0] || typeof args[0] !== 'object') {
-    return {};
+export const validateApiBase = (apiBase: unknown): apiBase is BaseAddress => {
+  if (typeof apiBase !== 'string') {
+    throw new Error(`API base must be a string, got: ${typeof apiBase}`);
   }
+  return apiBase in DEFAULT_BASE_ADDRESSES;
+};
 
-  if (!isOptionsHash(args[0])) {
-    return args.shift();
-  }
+export type ProcessedOptions = {
+  authenticator: RequestAuthenticator | null;
+  headers: RequestHeaders;
+  settings: {timeout?: number; maxNetworkRetries?: number};
+  streaming: boolean;
+  apiBase: BaseAddress | null;
+};
 
-  const argKeys = Object.keys(args[0]);
-
-  const optionKeysInArgs = argKeys.filter((key) => OPTIONS_KEYS.includes(key));
-
-  // In some cases options may be the provided as the first argument.
-  // Here we're detecting a case where there are two distinct arguments
-  // (the first being args and the second options) and with known
-  // option keys in the first so that we can warn the user about it.
-  if (
-    optionKeysInArgs.length > 0 &&
-    optionKeysInArgs.length !== argKeys.length
-  ) {
-    emitWarning(
-      `Options found in arguments (${optionKeysInArgs.join(
-        ', '
-      )}). Did you mean to pass an options object? See https://github.com/stripe/stripe-node/wiki/Passing-Options.`
-    );
-  }
-
-  return {};
-}
-
-/**
- * Return the options hash from a list of arguments
- */
-export function getOptionsFromArgs(args: RequestArgs): Options {
-  const opts: Options = {
-    host: null,
+export function processOptions(
+  options: RequestOptions | undefined
+): ProcessedOptions {
+  const result: ProcessedOptions = {
+    authenticator: null,
     headers: {},
     settings: {},
     streaming: false,
+    apiBase: null,
   };
-  if (args.length > 0) {
-    const arg = args[args.length - 1];
-    if (typeof arg === 'string') {
-      opts.authenticator = createApiKeyAuthenticator(args.pop() as string);
-    } else if (isOptionsHash(arg)) {
-      const params = {...(args.pop() as Record<string, unknown>)};
 
-      const extraKeys = Object.keys(params).filter(
-        (key) => !OPTIONS_KEYS.includes(key)
-      );
-
-      if (extraKeys.length) {
-        emitWarning(
-          `Invalid options found (${extraKeys.join(', ')}); ignoring.`
-        );
-      }
-
-      if (params.apiKey) {
-        opts.authenticator = createApiKeyAuthenticator(params.apiKey as string);
-      }
-      if (params.idempotencyKey) {
-        opts.headers['Idempotency-Key'] = params.idempotencyKey as string;
-      }
-      if (params.stripeAccount) {
-        opts.headers['Stripe-Account'] = params.stripeAccount as string;
-      }
-      if (params.stripeContext) {
-        if (opts.headers['Stripe-Account']) {
-          throw new Error(
-            "Can't specify both stripeAccount and stripeContext."
-          );
-        }
-        opts.headers['Stripe-Context'] = params.stripeContext as string;
-      }
-      if (params.apiVersion) {
-        opts.headers['Stripe-Version'] = params.apiVersion as string;
-      }
-      if (Number.isInteger(params.maxNetworkRetries)) {
-        opts.settings.maxNetworkRetries = params.maxNetworkRetries as number;
-      }
-      if (Number.isInteger(params.timeout)) {
-        opts.settings.timeout = params.timeout as number;
-      }
-      if (params.host) {
-        opts.host = params.host as string;
-      }
-      if (params.authenticator) {
-        if (params.apiKey) {
-          throw new Error("Can't specify both apiKey and authenticator.");
-        }
-        if (typeof params.authenticator !== 'function') {
-          throw new Error(
-            'The authenticator must be a function ' +
-              'receiving a request as the first parameter.'
-          );
-        }
-        opts.authenticator = params.authenticator as RequestAuthenticator;
-      }
-      if (params.additionalHeaders) {
-        opts.headers = params.additionalHeaders as {
-          [headerName: string]: string;
-        };
-      }
-      if (params.streaming) {
-        opts.streaming = true;
-      }
-    }
+  if (!options) {
+    return result;
   }
-  return opts;
-}
 
-/**
- * Provide simple "Class" extension mechanism.
- * <!-- Public API accessible via Stripe.StripeResource.extend -->
- */
-export function protoExtend(
-  this: any,
-  sub: any
-): {new (...args: any[]): StripeResourceObject} {
-  // eslint-disable-next-line @typescript-eslint/no-this-alias
-  const Super = this;
-  const Constructor = Object.prototype.hasOwnProperty.call(sub, 'constructor')
-    ? sub.constructor
-    : function(this: StripeResourceObject, ...args: any[]): void {
-        Super.apply(this, args);
-      };
+  if (options.apiKey) {
+    result.authenticator = createApiKeyAuthenticator(options.apiKey);
+  }
+  if (options.idempotencyKey) {
+    result.headers['Idempotency-Key'] = options.idempotencyKey;
+  }
+  if (options.stripeAccount) {
+    result.headers['Stripe-Account'] = options.stripeAccount;
+  }
+  if (options.stripeContext) {
+    if (result.headers['Stripe-Account']) {
+      throw new Error("Can't specify both stripeAccount and stripeContext.");
+    }
+    result.headers['Stripe-Context'] = options.stripeContext as string;
+  }
+  if (options.apiVersion) {
+    result.headers['Stripe-Version'] = options.apiVersion;
+  }
+  if (Number.isInteger(options.maxNetworkRetries)) {
+    result.settings.maxNetworkRetries = options.maxNetworkRetries;
+  }
+  if (Number.isInteger(options.timeout)) {
+    result.settings.timeout = options.timeout;
+  }
+  if (options.authenticator) {
+    if (options.apiKey) {
+      throw new Error("Can't specify both apiKey and authenticator.");
+    }
+    if (typeof options.authenticator !== 'function') {
+      throw new Error(
+        'The authenticator must be a function ' +
+          'receiving a request as the first parameter.'
+      );
+    }
+    result.authenticator = options.authenticator;
+  }
+  if (options.headers) {
+    Object.assign(result.headers, options.headers);
+  }
+  if (options.streaming) {
+    result.streaming = true;
+  }
 
-  // This initialization logic is somewhat sensitive to be compatible with
-  // divergent JS implementations like the one found in Qt. See here for more
-  // context:
-  //
-  // https://github.com/stripe/stripe-node/pull/334
-  Object.assign(Constructor, Super);
-  Constructor.prototype = Object.create(Super.prototype);
-  Object.assign(Constructor.prototype, sub);
-
-  return Constructor;
+  return result;
 }
 
 /**
@@ -302,29 +300,6 @@ export function normalizeHeader(header: string): string {
     .join('-');
 }
 
-export function callbackifyPromiseWithTimeout<T>(
-  promise: Promise<T>,
-  callback: ((error: unknown, result: T | null) => void) | null
-): Promise<T | void> {
-  if (callback) {
-    // Ensure callback is called outside of promise stack.
-    return promise.then(
-      (res) => {
-        setTimeout(() => {
-          callback(null, res);
-        }, 0);
-      },
-      (err) => {
-        setTimeout(() => {
-          callback(err, null);
-        }, 0);
-      }
-    );
-  }
-
-  return promise;
-}
-
 /**
  * Allow for special capitalization cases (such as OAuth)
  */
@@ -334,16 +309,6 @@ export function pascalToCamelCase(name: string): string {
   } else {
     return name[0].toLowerCase() + name.substring(1);
   }
-}
-
-export function emitWarning(warning: string): void {
-  if (typeof process.emitWarning !== 'function') {
-    return console.warn(
-      `Stripe: ${warning}`
-    ); /* eslint-disable-line no-console */
-  }
-
-  return process.emitWarning(warning, 'Stripe');
 }
 
 export function isObject(obj: unknown): boolean {
@@ -400,13 +365,29 @@ export function validateInteger(
   return n as number;
 }
 
-export function determineProcessUserAgentProperties(): Record<string, string> {
-  return typeof process === 'undefined'
-    ? {}
-    : {
-        lang_version: process.version,
-        platform: process.platform,
-      };
+export const AI_AGENTS: [string, string][] = [
+  // The beginning of the section generated from our OpenAPI spec
+  ['ANTIGRAVITY_CLI_ALIAS', 'antigravity'],
+  ['CLAUDECODE', 'claude_code'],
+  ['CLINE_ACTIVE', 'cline'],
+  ['CODEX_SANDBOX', 'codex_cli'],
+  ['CODEX_THREAD_ID', 'codex_cli'],
+  ['CODEX_SANDBOX_NETWORK_DISABLED', 'codex_cli'],
+  ['CODEX_CI', 'codex_cli'],
+  ['CURSOR_AGENT', 'cursor'],
+  ['GEMINI_CLI', 'gemini_cli'],
+  ['OPENCLAW_SHELL', 'openclaw'],
+  ['OPENCODE', 'open_code'],
+  // The end of the section generated from our OpenAPI spec
+];
+
+export function detectAIAgent(env: Record<string, string | undefined>): string {
+  for (const [envVar, agentName] of AI_AGENTS) {
+    if (env[envVar]) {
+      return agentName;
+    }
+  }
+  return '';
 }
 
 export function createApiKeyAuthenticator(
@@ -477,10 +458,21 @@ export function parseHttpHeaderAsString<K extends keyof RequestHeaders>(
 }
 
 export function parseHttpHeaderAsNumber<K extends keyof RequestHeaders>(
-  header: RequestHeaders[K]
-): number {
-  const number = Array.isArray(header) ? header[0] : header;
-  return Number(number);
+  header: RequestHeaders[K] | null | undefined
+): number | undefined {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (value == null) {
+    return undefined;
+  }
+  const trimmed = String(value).trim();
+  if (trimmed === '') {
+    return undefined;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+  return parsed;
 }
 
 export function parseHeadersForFetch(
@@ -489,4 +481,27 @@ export function parseHeadersForFetch(
   return Object.entries(headers).map(([key, value]) => {
     return [key, parseHttpHeaderAsString(value)];
   });
+}
+
+const CALL_SITE_MARKER = '\nOriginating from:';
+
+/**
+ * We do some async indirection in our HTTP calling code that means stack traces aren't correct traced back to their actual origin in userland
+ * So, we call this with a manually sourced error right before we do async HTTP operations, capturing the stack trace
+ * NOTE: Modifies the `err` arg.
+ */
+export function attachCallSiteToError(
+  err: Error,
+  callSiteStack: string | undefined
+): void {
+  if (!err || !err.stack || !callSiteStack) {
+    return;
+  }
+  const callerFrames = callSiteStack.substring(callSiteStack.indexOf('\n') + 1);
+  const existingMarkerIdx = err.stack.indexOf(CALL_SITE_MARKER);
+  const baseStack =
+    existingMarkerIdx >= 0
+      ? err.stack.substring(0, existingMarkerIdx)
+      : err.stack;
+  err.stack = `${baseStack}${CALL_SITE_MARKER}\n${callerFrames}`;
 }

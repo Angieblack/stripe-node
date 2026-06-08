@@ -7,9 +7,16 @@ import {
   StripeConnectionError,
   StripeError,
   StripeIdempotencyError,
+  StripeInvalidClientError,
+  StripeInvalidGrantError,
+  StripeInvalidRequestError,
+  StripeInvalidScopeError,
+  StripeOAuthError,
+  StripeOAuthInvalidRequestError,
   StripePermissionError,
   StripeRateLimitError,
-  StripeUnknownError,
+  StripeUnsupportedGrantTypeError,
+  StripeUnsupportedResponseTypeError,
   TemporarySessionExpiredError,
 } from '../src/Error.js';
 import {RequestSender} from '../src/RequestSender.js';
@@ -162,6 +169,224 @@ describe('RequestSender', () => {
     });
   });
 
+  describe('_getContentLength', () => {
+    describe('string encoding', () => {
+      it('should return correct byte length for ASCII strings', () => {
+        const result = sender._getContentLength('hello');
+        expect(result).to.equal(5);
+      });
+
+      it('should return correct byte length for empty strings', () => {
+        const result = sender._getContentLength('');
+        expect(result).to.equal(0);
+      });
+
+      it('should return correct byte length for strings with spaces', () => {
+        const result = sender._getContentLength('hello world');
+        expect(result).to.equal(11);
+      });
+
+      it('should calculate correct byte length for 2-byte unicode characters', () => {
+        // å is 2 bytes in UTF-8
+        const result = sender._getContentLength('dåvid');
+        expect(result).to.equal(6); // d(1) + å(2) + v(1) + i(1) + d(1) = 6
+      });
+
+      it('should calculate correct byte length for 3-byte unicode characters', () => {
+        // ✓ (U+2713) is 3 bytes in UTF-8
+        const result = sender._getContentLength('✓');
+        expect(result).to.equal(3);
+      });
+
+      it('should calculate correct byte length for 4-byte unicode characters (emoji)', () => {
+        // 🎉 (U+1F389) is 4 bytes in UTF-8
+        const result = sender._getContentLength('🎉');
+        expect(result).to.equal(4);
+      });
+
+      it('should handle strings with mixed ASCII and unicode characters', () => {
+        // "test🎉data" = test(4) + 🎉(4) + data(4) = 12
+        const result = sender._getContentLength('test🎉data');
+        expect(result).to.equal(12);
+      });
+
+      it('should handle multiple emoji characters', () => {
+        // Each emoji is typically 4 bytes
+        const result = sender._getContentLength('🎉🎊🎈');
+        expect(result).to.equal(12); // 3 emojis * 4 bytes each
+      });
+
+      it('should calculate correct byte length for Chinese characters', () => {
+        // Chinese characters are typically 3 bytes in UTF-8
+        const result = sender._getContentLength('你好');
+        expect(result).to.equal(6); // 2 characters * 3 bytes each
+      });
+
+      it('should calculate correct byte length for Arabic characters', () => {
+        // Arabic characters are typically 2 bytes in UTF-8
+        const result = sender._getContentLength('مرحبا');
+        expect(result).to.equal(10); // 5 characters * 2 bytes each
+      });
+
+      it('should handle zero-width characters correctly', () => {
+        // Zero-width joiner (U+200D) is 3 bytes in UTF-8
+        const result = sender._getContentLength('a\u200Db');
+        expect(result).to.equal(5); // a(1) + ZWJ(3) + b(1) = 5
+      });
+
+      it('should handle zero-width non-joiner correctly', () => {
+        // Zero-width non-joiner (U+200C) is 3 bytes in UTF-8
+        const result = sender._getContentLength('test\u200Ctext');
+        expect(result).to.equal(11); // test(4) + ZWNJ(3) + text(4) = 11
+      });
+
+      it('should handle zero-width space correctly', () => {
+        // Zero-width space (U+200B) is 3 bytes in UTF-8
+        const result = sender._getContentLength('word\u200Bword');
+        expect(result).to.equal(11); // word(4) + ZWS(3) + word(4) = 11
+      });
+
+      it('should handle combining characters correctly', () => {
+        // e + combining acute accent (U+0301)
+        // e is 1 byte, combining acute is 2 bytes
+        const result = sender._getContentLength('e\u0301');
+        expect(result).to.equal(3);
+      });
+
+      it('should handle emoji with skin tone modifiers correctly', () => {
+        // 👋 (waving hand) + 🏽 (medium skin tone modifier)
+        // Base emoji (4 bytes) + skin tone modifier (4 bytes) = 8 bytes
+        const result = sender._getContentLength('👋🏽');
+        expect(result).to.equal(8);
+      });
+
+      it('should handle emoji ZWJ sequences correctly', () => {
+        // Family emoji is composed of multiple code points joined by ZWJ
+        // For example: 👨‍👩‍👧‍👦 (man + ZWJ + woman + ZWJ + girl + ZWJ + boy)
+        const result = sender._getContentLength('👨‍👩‍👧‍👦');
+        expect(result).to.equal(25); // Multiple emojis + ZWJ characters
+      });
+
+      it('should handle surrogate pairs correctly', () => {
+        // Characters outside the BMP require surrogate pairs
+        // 𝕳 (U+1D573) is 4 bytes in UTF-8
+        const result = sender._getContentLength('𝕳𝖊𝖑𝖑𝖔');
+        expect(result).to.equal(20); // 5 characters * 4 bytes each
+      });
+
+      it('should handle newlines and special characters', () => {
+        const result = sender._getContentLength('line1\nline2\r\nline3');
+        expect(result).to.equal(18); // Each \n and \r is 1 byte
+      });
+
+      it('should handle tab characters', () => {
+        const result = sender._getContentLength('col1\tcol2\tcol3');
+        expect(result).to.equal(14); // Each \t is 1 byte
+      });
+
+      it('should handle complex JSON-like strings with unicode', () => {
+        const jsonString = '{"name":"José","city":"São Paulo"}';
+        const result = sender._getContentLength(jsonString);
+        // é is 2 bytes, ã is 2 bytes, rest are ASCII (1 byte each)
+        expect(result).to.equal(36);
+      });
+    });
+
+    describe('Uint8Array handling', () => {
+      it('should return correct byte length for empty Uint8Array', () => {
+        const data = new Uint8Array([]);
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(0);
+      });
+
+      it('should return correct byte length for Uint8Array with data', () => {
+        const data = new Uint8Array([1, 2, 3, 4, 5]);
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(5);
+      });
+
+      it('should return correct byte length for Uint8Array with 256 bytes', () => {
+        const data = new Uint8Array(256);
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(256);
+      });
+
+      it('should return correct byte length for Uint8Array with large data', () => {
+        const data = new Uint8Array(10000);
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(10000);
+      });
+
+      it('should handle Uint8Array containing encoded unicode data', () => {
+        // Manually encode "hello" as UTF-8 bytes
+        const encoder = new TextEncoder();
+        const data = encoder.encode('hello');
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(5);
+      });
+
+      it('should handle Uint8Array containing encoded unicode with wide characters', () => {
+        // Encode "你好" (Chinese for "hello") as UTF-8 bytes
+        const encoder = new TextEncoder();
+        const data = encoder.encode('你好');
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(6); // 2 characters * 3 bytes each
+      });
+
+      it('should handle Uint8Array containing encoded emoji', () => {
+        const encoder = new TextEncoder();
+        const data = encoder.encode('🎉');
+        const result = sender._getContentLength(data);
+        expect(result).to.equal(4);
+      });
+    });
+
+    describe('consistency between string and Uint8Array', () => {
+      it('should return same length for ASCII string vs its Uint8Array encoding', () => {
+        const str = 'hello world';
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(str);
+
+        expect(sender._getContentLength(str)).to.equal(
+          sender._getContentLength(bytes)
+        );
+        expect(sender._getContentLength(str)).to.equal(11);
+      });
+
+      it('should return same length for unicode string vs its Uint8Array encoding', () => {
+        const str = 'dåvid';
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(str);
+
+        expect(sender._getContentLength(str)).to.equal(
+          sender._getContentLength(bytes)
+        );
+        expect(sender._getContentLength(str)).to.equal(6);
+      });
+
+      it('should return same length for emoji string vs its Uint8Array encoding', () => {
+        const str = '🎉🎊';
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(str);
+
+        expect(sender._getContentLength(str)).to.equal(
+          sender._getContentLength(bytes)
+        );
+        expect(sender._getContentLength(str)).to.equal(8);
+      });
+
+      it('should return same length for mixed content string vs its Uint8Array encoding', () => {
+        const str = 'Hello 世界 🌍';
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(str);
+
+        expect(sender._getContentLength(str)).to.equal(
+          sender._getContentLength(bytes)
+        );
+      });
+    });
+  });
+
   describe('Parameter encoding', () => {
     // Use a real instance of stripe as we're mocking the http.request responses.
     const realStripe = require('../src/stripe.cjs.node.js')(FAKE_API_KEY);
@@ -211,10 +436,13 @@ describe('RequestSender', () => {
           .get('/v1/customers/.', '')
           .reply(200, '{}');
 
-        realStripe.customers.retrieve('.', (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.customers
+          .retrieve('.')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('handles .. as a query param', (done) => {
@@ -222,10 +450,13 @@ describe('RequestSender', () => {
           .get('/v1/customers/..', '')
           .reply(200, '{}');
 
-        realStripe.customers.retrieve('..', (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.customers
+          .retrieve('..')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('handles empty string as a query param', (done) => {
@@ -235,10 +466,13 @@ describe('RequestSender', () => {
           .get('/v1/customers/', '')
           .reply(200, '{}');
 
-        realStripe.customers.retrieve('', (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.customers
+          .retrieve('')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('handles empty string as a query param for namespaced resources', (done) => {
@@ -248,10 +482,13 @@ describe('RequestSender', () => {
           .get('/v1/checkout/sessions/', '')
           .reply(200, '{}');
 
-        realStripe.checkout.sessions.retrieve('', (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.checkout.sessions
+          .retrieve('')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('handles empty string as a query param for nested resources', (done) => {
@@ -261,14 +498,13 @@ describe('RequestSender', () => {
           .get('/v1/customers/cus_123/balance_transactions/', '')
           .reply(200, '{}');
 
-        realStripe.customers.retrieveBalanceTransaction(
-          'cus_123',
-          '',
-          (err, response) => {
-            done(err);
+        realStripe.customers
+          .retrieveBalanceTransaction('cus_123', '')
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('does not include trailing slash for endpoints without query parameters', (done) => {
@@ -277,10 +513,13 @@ describe('RequestSender', () => {
           .get('/v1/customers', '')
           .reply(200, '{}');
 
-        realStripe.customers.list((err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.customers
+          .list()
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('works correctly with undefined optional arguments', (done) => {
@@ -288,10 +527,13 @@ describe('RequestSender', () => {
           .get('/v1/accounts/acct_123')
           .reply(200, '{}');
 
-        realStripe.accounts.retrieve('acct_123', undefined, (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.accounts
+          .retrieve('acct_123')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('works correctly with null optional arguments', (done) => {
@@ -299,10 +541,13 @@ describe('RequestSender', () => {
           .get('/v1/accounts/acct_123')
           .reply(200, '{}');
 
-        realStripe.accounts.retrieve('acct_123', null, (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.accounts
+          .retrieve('acct_123')
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes data for DELETE requests as query params', (done) => {
@@ -321,10 +566,13 @@ describe('RequestSender', () => {
           .delete(/.*/)
           .reply(200, '{}');
 
-        realStripe.invoiceItems.del('invoiceItemId1', data, (err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.invoiceItems
+          .del('invoiceItemId1', data)
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes the body in POST requests', (done) => {
@@ -355,14 +603,13 @@ describe('RequestSender', () => {
           .post(options.path, options.body)
           .reply(200, '{}');
 
-        realStripe.subscriptions.update(
-          'sub_123',
-          options.data,
-          (err, response) => {
-            done(err);
+        realStripe.subscriptions
+          .update('sub_123', options.data)
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes the body in POST requests as JSON for v2', (done) => {
@@ -388,13 +635,13 @@ describe('RequestSender', () => {
           .post(options.path, options.body)
           .reply(200, '{}');
 
-        realStripe.v2.billing.meterEventSession.create(
-          options.data,
-          (err, response) => {
-            done(err);
+        realStripe.v2.billing.meterEventSession
+          .create(options.data)
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes null values in the body in POST correctly for v2', (done) => {
@@ -420,13 +667,13 @@ describe('RequestSender', () => {
           .post(options.path, options.body)
           .reply(200, '{}');
 
-        realStripe.v2.billing.meterEventSession.create(
-          options.data,
-          (err, response) => {
-            done(err);
+        realStripe.v2.billing.meterEventSession
+          .create(options.data)
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes data for GET requests as query params for v2', (done) => {
@@ -438,14 +685,13 @@ describe('RequestSender', () => {
           )
           .reply(200, '{}');
 
-        realStripe.v2.core.events.retrieve(
-          'event_123',
-          {include: ['defaults', 'configuration']},
-          (err, response) => {
-            done(err);
+        realStripe.v2.core.events
+          .retrieve('event_123', {include: ['defaults', 'configuration']})
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('always includes Content-Length in POST requests even when empty', (done) => {
@@ -467,14 +713,13 @@ describe('RequestSender', () => {
           .post(options.path, options.body)
           .reply(200, '{}');
 
-        realStripe.subscriptions.update(
-          'sub_123',
-          options.data,
-          (err, response) => {
-            done(err);
+        realStripe.subscriptions
+          .update('sub_123', options.data)
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('encodes Date objects in POST requests as JSON for v2', (done) => {
@@ -500,31 +745,30 @@ describe('RequestSender', () => {
           .post(options.path, options.body)
           .reply(200, '{}');
 
-        realStripe.v2.billing.meterEventSession.create(
-          options.data,
-          (err, response) => {
-            done(err);
+        realStripe.v2.billing.meterEventSession
+          .create(options.data)
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
-      it('allows overriding host', (done) => {
-        const scope = nock('https://myhost')
-          .get('/v1/accounts/acct_123')
+      it('does not allow overriding host per-request', (done) => {
+        const scope = nock('https://api.stripe.com')
+          .get('/v1/accounts/acct_123?host=myhost')
           .reply(200, '{}');
 
-        realStripe.accounts.retrieve(
-          'acct_123',
-          {},
-          {
+        realStripe.accounts
+          .retrieve('acct_123', {
+            // assumed to be a request param, not an option
             host: 'myhost',
-          },
-          (err, response) => {
-            done(err);
+          })
+          .then((response) => {
             scope.done();
-          }
-        );
+            done();
+          })
+          .catch(done);
       });
 
       it('sends with APIVersion in header', (done) => {
@@ -535,10 +779,13 @@ describe('RequestSender', () => {
           .get('/v1/subscriptions')
           .reply(200, '{}');
 
-        realStripe.subscriptions.list((err, response) => {
-          done(err);
-          scope.done();
-        });
+        realStripe.subscriptions
+          .list()
+          .then((response) => {
+            scope.done();
+            done();
+          })
+          .catch(done);
       });
     });
 
@@ -554,7 +801,7 @@ describe('RequestSender', () => {
             '/v1/files/file_1Mr4LDLkdIwHu7ixFCz0dZiH/contents',
             {},
             {
-              host: 'files.stripe.com',
+              apiBase: 'files',
               streaming: true,
             }
           )
@@ -618,10 +865,15 @@ describe('RequestSender', () => {
           .post(options.path, options.params)
           .replyWithError('bad stuff');
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err.detail.message).to.deep.equal('bad stuff');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err.detail.message).to.deep.equal('bad stuff');
+            done();
+          });
       });
 
       it('throws an error on connection timeout', (done) => {
@@ -634,14 +886,19 @@ describe('RequestSender', () => {
             if (err) {
               return done(err);
             }
-            stripe.charges.create(options.data, (err, result) => {
-              expect(err.detail.message).to.deep.equal('ETIMEDOUT');
-              expect(err.message).to.deep.equal(
-                'Request aborted due to timeout being reached (10ms)'
-              );
-              closeServer();
-              done();
-            });
+            stripe.charges
+              .create(options.data)
+              .then(() => {
+                done(new Error('Expected an error'));
+              })
+              .catch((err) => {
+                expect(err.detail.message).to.deep.equal('ETIMEDOUT');
+                expect(err.message).to.deep.equal(
+                  'Request aborted due to timeout being reached (10ms)'
+                );
+                closeServer();
+                done();
+              });
           }
         );
       });
@@ -658,13 +915,18 @@ describe('RequestSender', () => {
             if (err) {
               return done(err);
             }
-            stripe.charges.create(options.data, (err, result) => {
-              expect(err.message).to.deep.equal(
-                'Invalid JSON received from the Stripe API'
-              );
-              closeServer();
-              done();
-            });
+            stripe.charges
+              .create(options.data)
+              .then(() => {
+                done(new Error('Expected an error'));
+              })
+              .catch((err) => {
+                expect(err.message).to.deep.equal(
+                  'Invalid JSON received from the Stripe API'
+                );
+                closeServer();
+                done();
+              });
           }
         );
       });
@@ -682,10 +944,15 @@ describe('RequestSender', () => {
             if (err) {
               return done(err);
             }
-            stripe.charges.create(options.data, (err, result) => {
-              expect(err).to.be.an.instanceOf(StripeConnectionError);
-              done();
-            });
+            stripe.charges
+              .create(options.data)
+              .then(() => {
+                done(new Error('Expected an error'));
+              })
+              .catch((err) => {
+                expect(err).to.be.an.instanceOf(StripeConnectionError);
+                done();
+              });
           }
         );
       });
@@ -699,11 +966,16 @@ describe('RequestSender', () => {
             },
           });
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err).to.be.an.instanceOf(StripeAuthenticationError);
-          expect(err.message).to.be.equal('message');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeAuthenticationError);
+            expect(err.message).to.be.equal('message');
+            done();
+          });
       });
 
       it('throws a StripePermissionError on 403', (done) => {
@@ -715,11 +987,16 @@ describe('RequestSender', () => {
             },
           });
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err).to.be.an.instanceOf(StripePermissionError);
-          expect(err.message).to.be.equal('message');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripePermissionError);
+            expect(err.message).to.be.equal('message');
+            done();
+          });
       });
 
       it('throws a StripeRateLimitError on 429', (done) => {
@@ -731,11 +1008,16 @@ describe('RequestSender', () => {
             },
           });
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err).to.be.an.instanceOf(StripeRateLimitError);
-          expect(err.message).to.be.equal('message');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeRateLimitError);
+            expect(err.message).to.be.equal('message');
+            done();
+          });
       });
 
       it('throws a StripeError based on the underlying error type', (done) => {
@@ -743,9 +1025,9 @@ describe('RequestSender', () => {
           type: 'idempotency_error',
         };
 
-        expect(StripeError.generate(error)).to.be.an.instanceOf(
-          StripeIdempotencyError
-        );
+        expect(
+          StripeError.generate({...error, statusCode: 400})
+        ).to.be.an.instanceOf(StripeIdempotencyError);
 
         nock(`https://${options.host}`)
           .post(options.path, options.params)
@@ -753,10 +1035,15 @@ describe('RequestSender', () => {
             error,
           });
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err).to.be.an.instanceOf(StripeIdempotencyError);
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeIdempotencyError);
+            done();
+          });
       });
 
       it('throws a v2 StripeError based on the underlying error "code" for v2 APIs', (done) => {
@@ -771,11 +1058,16 @@ describe('RequestSender', () => {
             error,
           });
 
-        realStripe.v2.billing.meterEventSession.create({}, (err) => {
-          expect(err).to.be.an.instanceOf(TemporarySessionExpiredError);
-          expect(err.message).to.equal('you messed up');
-          done();
-        });
+        realStripe.v2.billing.meterEventSession
+          .create({})
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(TemporarySessionExpiredError);
+            expect(err.message).to.equal('you messed up');
+            done();
+          });
       });
 
       it('throws a v1 StripeError for v1 APIs', (done) => {
@@ -790,14 +1082,19 @@ describe('RequestSender', () => {
             error,
           });
 
-        realStripe.customers.create({}, (err) => {
-          expect(err).to.be.an.instanceOf(StripeError);
-          expect(err).to.be.an.instanceOf(StripeUnknownError);
-          expect(err).not.to.be.an.instanceOf(TemporarySessionExpiredError);
-          expect(err.message).to.equal('you messed up');
-          expect(err.raw.message).to.equal('you messed up');
-          done();
-        });
+        realStripe.customers
+          .create({})
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeError);
+            expect(err).to.be.an.instanceOf(StripeInvalidRequestError);
+            expect(err).not.to.be.an.instanceOf(TemporarySessionExpiredError);
+            expect(err.message).to.equal('you messed up');
+            expect(err.raw.message).to.equal('you messed up');
+            done();
+          });
       });
 
       it('retries connection timeout errors', (done) => {
@@ -813,12 +1110,17 @@ describe('RequestSender', () => {
             if (err) {
               return done(err);
             }
-            stripe.charges.create(options.data, (err, result) => {
-              expect(err.detail.message).to.deep.equal('ETIMEDOUT');
-              expect(nRequestsReceived).to.equal(3);
-              closeServer();
-              done();
-            });
+            stripe.charges
+              .create(options.data)
+              .then(() => {
+                done(new Error('Expected an error'));
+              })
+              .catch((err) => {
+                expect(err.detail.message).to.deep.equal('ETIMEDOUT');
+                expect(nRequestsReceived).to.equal(3);
+                closeServer();
+                done();
+              });
           }
         );
       });
@@ -837,10 +1139,13 @@ describe('RequestSender', () => {
             amount: 1000,
           });
 
-        realStripe.charges.create(options.data, (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('throws on multiple closed connection errors', (done) => {
@@ -850,10 +1155,15 @@ describe('RequestSender', () => {
           .post(options.path, options.params)
           .replyWithError({code: 'ECONNRESET'});
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err.detail.code).to.deep.equal('ECONNRESET');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err.detail.code).to.deep.equal('ECONNRESET');
+            done();
+          });
       });
 
       it('should retry the request if max retries are set', (done) => {
@@ -865,12 +1175,19 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err) => {
-          const errorMessage = RequestSender._generateConnectionErrorMessage(1);
-          expect(err.message).to.equal(errorMessage);
-          expect(err.detail.message).to.deep.equal('worse stuff');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            const errorMessage = RequestSender._generateConnectionErrorMessage(
+              1
+            );
+            expect(err.message).to.equal(errorMessage);
+            expect(err.detail.message).to.deep.equal('worse stuff');
+            done();
+          });
       });
 
       it('should stop retrying after a successful retry', (done) => {
@@ -886,10 +1203,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 2);
 
-        realStripe.charges.create(options.data, (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('should give precedence to request-level (1) vs client-level maxNetworkRetries (0)', (done) => {
@@ -908,10 +1228,12 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 0);
 
-        realStripe.charges.create(
-          options.data,
-          {maxNetworkRetries: 1},
-          (err) => {
+        realStripe.charges
+          .create(options.data, {maxNetworkRetries: 1})
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
             const errorMessage = RequestSender._generateConnectionErrorMessage(
               1
             );
@@ -919,8 +1241,7 @@ describe('RequestSender', () => {
             expect(err.detail.message).to.deep.equal('worse stuff');
             expect(nReceivedRequests).to.equal(2);
             done();
-          }
-        );
+          });
       });
 
       it('should give precedence to request-level (0) vs client-level maxNetworkRetries (1)', (done) => {
@@ -932,18 +1253,19 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(
-          options.data,
-          {maxNetworkRetries: 0},
-          (err) => {
+        realStripe.charges
+          .create(options.data, {maxNetworkRetries: 0})
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
             expect(err.detail.message).to.deep.equal('bad stuff');
             const errorMessage = RequestSender._generateConnectionErrorMessage(
               0
             );
             expect(err.message).to.equal(errorMessage);
             done();
-          }
-        );
+          });
       });
 
       it('should retry on a 409 error', (done) => {
@@ -963,10 +1285,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('should not retry on a 400 error', (done) => {
@@ -974,16 +1299,21 @@ describe('RequestSender', () => {
           .post(options.path, options.params)
           .reply(400, {
             error: {
-              type: 'card_error',
+              type: 'invalid_request_error',
             },
           });
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err.type).to.equal('StripeCardError');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err.type).to.equal('StripeInvalidRequestError');
+            done();
+          });
       });
 
       it('should not retry when a header says not to', (done) => {
@@ -1001,10 +1331,15 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(err.type).to.equal('StripeAPIError');
-          done();
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err.type).to.equal('StripeAPIError');
+            done();
+          });
       });
 
       it("should retry when a header says it should, even on status codes we ordinarily wouldn't", (done) => {
@@ -1024,10 +1359,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('should handle OAuth errors gracefully', (done) => {
@@ -1041,10 +1379,166 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.oauth.token(options.data, (err) => {
-          expect(err.type).to.equal('StripeInvalidGrantError');
-          done();
-        });
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeInvalidGrantError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeInvalidGrantError');
+            done();
+          });
+      });
+
+      it('should handle OAuth invalid_client errors', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(401, {
+            error: 'invalid_client',
+            error_description: 'No authentication was provided.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeInvalidClientError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeInvalidClientError');
+            done();
+          });
+      });
+
+      it('should handle OAuth invalid_request errors', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(400, {
+            error: 'invalid_request',
+            error_description: 'Missing required parameter.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeOAuthInvalidRequestError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeOAuthInvalidRequestError');
+            done();
+          });
+      });
+
+      it('should handle OAuth invalid_scope errors', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(400, {
+            error: 'invalid_scope',
+            error_description: 'Invalid scope.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeInvalidScopeError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeInvalidScopeError');
+            done();
+          });
+      });
+
+      it('should handle OAuth unsupported_grant_type errors', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(400, {
+            error: 'unsupported_grant_type',
+            error_description: 'Unsupported grant type.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeUnsupportedGrantTypeError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeUnsupportedGrantTypeError');
+            done();
+          });
+      });
+
+      it('should handle OAuth unsupported_response_type errors', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(400, {
+            error: 'unsupported_response_type',
+            error_description: 'Unsupported response type.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeUnsupportedResponseTypeError);
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err.type).to.equal('StripeUnsupportedResponseTypeError');
+            done();
+          });
+      });
+
+      it('should handle unknown OAuth errors with generic StripeOAuthError', (done) => {
+        nock('https://connect.stripe.com')
+          .post('/oauth/token')
+          .reply(400, {
+            error: 'some_future_oauth_error',
+            error_description: 'Something new.',
+          });
+
+        realStripe.oauth
+          .token(options.data)
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(StripeOAuthError);
+            expect(err).to.be.an.instanceOf(StripeError);
+            expect(err.type).to.equal('StripeOAuthError');
+            done();
+          });
+      });
+
+      it('V2 errors take priority over status-code dispatch', (done) => {
+        nock(`https://${options.host}`)
+          .post('/v2/billing/meter_event_session', {})
+          .reply(401, {
+            error: {
+              type: 'temporary_session_expired',
+              message: 'session expired',
+            },
+          });
+
+        realStripe.v2.billing.meterEventSession
+          .create({})
+          .then(() => {
+            done(new Error('Expected an error'));
+          })
+          .catch((err) => {
+            expect(err).to.be.an.instanceOf(TemporarySessionExpiredError);
+            expect(err).not.to.be.an.instanceOf(StripeAuthenticationError);
+            expect(err.message).to.equal('session expired');
+            done();
+          });
       });
 
       it('should retry on a 503 error when the method is POST', (done) => {
@@ -1064,10 +1558,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('should retry on a 500 error when the method is GET', (done) => {
@@ -1087,10 +1584,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.retrieve('ch_123', (err, charge) => {
-          expect(charge.id).to.equal('ch_123');
-          done(err);
-        });
+        realStripe.charges
+          .retrieve('ch_123')
+          .then((charge) => {
+            expect(charge.id).to.equal('ch_123');
+            done();
+          })
+          .catch(done);
       });
 
       it('should add an idempotency key for retries using the POST method', (done) => {
@@ -1116,10 +1616,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.create(options.data, (err) => {
-          expect(headers).to.have.property('idempotency-key');
-          done(err);
-        });
+        realStripe.charges
+          .create(options.data)
+          .then(() => {
+            expect(headers).to.have.property('idempotency-key');
+            done();
+          })
+          .catch(done);
       });
 
       it('should not add idempotency key for retries using the GET method', (done) => {
@@ -1144,10 +1647,13 @@ describe('RequestSender', () => {
 
         realStripe._setApiNumberField('maxNetworkRetries', 1);
 
-        realStripe.charges.retrieve('ch_123', () => {
-          expect(headers).to.not.have.property('idempotency-key');
-          done();
-        });
+        realStripe.charges
+          .retrieve('ch_123')
+          .then(() => {
+            expect(headers).to.not.have.property('idempotency-key');
+            done();
+          })
+          .catch(done);
       });
 
       it('should reuse the given idempotency key provided for retries', (done) => {
@@ -1171,14 +1677,13 @@ describe('RequestSender', () => {
             ]);
           });
 
-        realStripe.charges.create(
-          options.data,
-          {idempotencyKey: key, maxNetworkRetries: 1},
-          () => {
+        realStripe.charges
+          .create(options.data, {idempotencyKey: key, maxNetworkRetries: 1})
+          .then(() => {
             expect(headers['idempotency-key']).to.equal(key);
             done();
-          }
-        );
+          })
+          .catch(done);
       });
 
       it('should allow the setting of network retries on a per-request basis', (done) => {
@@ -1197,14 +1702,13 @@ describe('RequestSender', () => {
             ]);
           });
 
-        realStripe.charges.create(
-          options.data,
-          {maxNetworkRetries: 1},
-          (err, charge) => {
+        realStripe.charges
+          .create(options.data, {maxNetworkRetries: 1})
+          .then((charge) => {
             expect(charge.id).to.equal('ch_123');
             done();
-          }
-        );
+          })
+          .catch(done);
       });
 
       it('should pick the per-request network retry setting if a global setting is set', (done) => {
@@ -1225,14 +1729,13 @@ describe('RequestSender', () => {
             ]);
           });
 
-        realStripe.charges.create(
-          options.data,
-          {maxNetworkRetries: 1},
-          (err, charge) => {
+        realStripe.charges
+          .create(options.data, {maxNetworkRetries: 1})
+          .then((charge) => {
             expect(charge.id).to.equal('ch_123');
             done();
-          }
-        );
+          })
+          .catch(done);
       });
 
       it('invokes the callback with successful results', (done) => {
@@ -1249,11 +1752,14 @@ describe('RequestSender', () => {
             if (err) {
               return done(err);
             }
-            stripe.charges.create(options.data, (err, result) => {
-              expect(result).to.deep.equal(returnedCharge);
-              closeServer();
-              done();
-            });
+            stripe.charges
+              .create(options.data)
+              .then((result) => {
+                expect(result).to.deep.equal(returnedCharge);
+                closeServer();
+                done();
+              })
+              .catch(done);
           }
         );
       });
@@ -1284,7 +1790,7 @@ describe('RequestSender', () => {
         );
       });
 
-      it('should calculate content-length correctly for unicode strings', (done) => {
+      it('should calculate content-length correctly for unicode strings in requests', (done) => {
         return getTestServerStripe(
           {},
           (req, res) => {
@@ -1341,6 +1847,75 @@ describe('RequestSender', () => {
           maxSec * 2 * 1000
         );
       });
+    });
+  });
+
+  describe('Stripe-Notice header', () => {
+    it('emits a warning when stripe-notice header is present', (done) => {
+      const warnings: Array<string> = [];
+
+      return getTestServerStripe(
+        {},
+        (req, res) => {
+          res.setHeader('Stripe-Notice', 'test notice');
+          res.writeHead(200, {'Content-Type': 'application/json'});
+          res.write('{}');
+          res.end();
+        },
+        (err, stripe, closeServer) => {
+          if (err) {
+            return done(err);
+          }
+
+          const originalEmitWarning = stripe._platformFunctions.emitWarning.bind(
+            stripe._platformFunctions
+          );
+          stripe._platformFunctions.emitWarning = (warning: string): void => {
+            warnings.push(warning);
+            originalEmitWarning(warning);
+          };
+
+          stripe.balance
+            .retrieve()
+            .then(() => {
+              expect(warnings).to.include('test notice');
+              closeServer();
+              done();
+            })
+            .catch(done);
+        }
+      );
+    });
+
+    it('does not emit a warning when stripe-notice header is absent', (done) => {
+      const warnings: Array<string> = [];
+
+      return getTestServerStripe(
+        {},
+        (req, res) => {
+          res.writeHead(200, {'Content-Type': 'application/json'});
+          res.write('{}');
+          res.end();
+        },
+        (err, stripe, closeServer) => {
+          if (err) {
+            return done(err);
+          }
+
+          stripe._platformFunctions.emitWarning = (warning: string): void => {
+            warnings.push(warning);
+          };
+
+          stripe.balance
+            .retrieve()
+            .then(() => {
+              expect(warnings).to.be.empty;
+              closeServer();
+              done();
+            })
+            .catch(done);
+        }
+      );
     });
   });
 
